@@ -1,8 +1,7 @@
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use futures_core::future::BoxFuture;
-use regex::Regex;
 use salvo_core::Request;
 use salvo_core::http::{HeaderMap, StatusCode, header};
 
@@ -13,11 +12,6 @@ use crate::lockers::{LockGuard, Locker, memory_locker};
 use crate::stores::UploadInfo;
 
 pub type UploadId = Option<String>;
-
-static RE_FILE_ID: OnceLock<Regex> = OnceLock::new();
-pub fn get_file_id_regex() -> &'static Regex {
-    RE_FILE_ID.get_or_init(|| Regex::new(r"([^/]+)/?$").expect("Invalid regex pattern"))
-}
 
 #[derive(Clone)]
 pub enum MaxSize {
@@ -107,7 +101,7 @@ pub struct TusOptions {
     /// Function to generate upload IDs
     pub upload_id_naming_function: NamingFunction,
 
-    /// Function to generate file uel
+    /// Function to generate file url
     pub generate_url_function: Option<GenerateUrlFunction>,
 
     pub on_incoming_request: Option<OnIncomingRequest>,
@@ -153,12 +147,12 @@ impl TusOptions {
 
     pub fn get_file_id_from_request(&self, req: &Request) -> TusResult<String> {
         let path = req.uri().path();
-        let re = get_file_id_regex();
-
-        re.captures(path)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_string())
-            .ok_or_else(|| TusError::FileIdError)
+        path.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .ok_or(TusError::FileIdError)
     }
 
     pub async fn get_configured_max_size(&self, req: &Request, upload_id: Option<String>) -> u64 {
@@ -203,18 +197,10 @@ impl TusOptions {
 
         // Default implementation
         if self.relative_location {
-            // NOTE: TS version returns `${path}/${id}` — even if path = "" it yields "/id"
-            // This matches that behavior.
             return Ok(format!("{}/{}", path, upload_id));
         }
 
-        Ok(format!(
-            "{}://{}{}{}",
-            proto,
-            host,
-            path,
-            format!("/{}", upload_id)
-        ))
+        Ok(format!("{}://{}{}/{}", proto, host, path, upload_id))
     }
 
     /// Rust version of BaseHandler.extractHostAndProto(...)
@@ -279,10 +265,6 @@ impl TusOptions {
 
         HostProto { proto, host }
     }
-
-    // pub async fn calculate_max_body_size(&self, req: &Request, file: UploadInfo,
-    // configured_max_size: Option<u64>) -> u64 {     todo!()
-    // }
 }
 
 impl Default for TusOptions {

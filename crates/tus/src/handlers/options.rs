@@ -18,21 +18,22 @@ async fn options(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let store = &state.store;
     let opts = &state.options;
     let max_size = opts.get_configured_max_size(req, None).await;
-    let headers = apply_options_headers(&mut res.headers);
+    apply_options_headers(&mut res.headers, req.headers(), opts);
 
-    headers.insert(H_TUS_VERSION, HeaderValue::from_static(TUS_VERSION));
+    res.headers
+        .insert(H_TUS_VERSION, HeaderValue::from_static(TUS_VERSION));
     if let Some(ext_header) = Extension::to_header_value(&store.extensions()) {
-        headers.insert(H_TUS_EXTENSION, ext_header);
+        res.headers.insert(H_TUS_EXTENSION, ext_header);
     }
 
     if max_size > 0 {
-        headers.insert(
+        res.headers.insert(
             H_TUS_MAX_SIZE,
             HeaderValue::from_str(max_size.to_string().as_str()).expect("invalid header value"),
         );
     }
 
-    headers.insert(
+    res.headers.insert(
         H_ACCESS_CONTROL_ALLOW_METHODS,
         HeaderValue::from_static("OPTIONS, POST, HEAD, PATCH, DELETE, GET"),
     );
@@ -43,20 +44,23 @@ async fn options(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         .and_then(|v| v.to_str().ok())
     {
         if let Ok(v) = HeaderValue::from_str(h) {
-            headers.insert(H_ACCESS_CONTROL_ALLOW_HEADERS, v);
+            res.headers.insert(H_ACCESS_CONTROL_ALLOW_HEADERS, v);
         }
     } else {
-        // fallback allow list
-        headers.insert(
-            H_ACCESS_CONTROL_ALLOW_HEADERS,
-            HeaderValue::from_static(
-                "Tus-Resumable, Upload-Length, Upload-Offset, Upload-Metadata, Content-Type, Content-Length",
-            ),
-        );
+        // Build allow headers list, including any configured additional headers
+        let mut allow_headers = "Tus-Resumable, Upload-Length, Upload-Offset, Upload-Metadata, Content-Type, Content-Length".to_string();
+        if !opts.allowed_headers.is_empty() {
+            allow_headers.push_str(", ");
+            allow_headers.push_str(&opts.allowed_headers.join(", "));
+        }
+        if let Ok(v) = HeaderValue::from_str(&allow_headers) {
+            res.headers.insert(H_ACCESS_CONTROL_ALLOW_HEADERS, v);
+        }
     }
 
-    headers.insert(H_ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
-    res.status_code(StatusCode::NO_CONTENT);
+    res.headers
+        .insert(H_ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+    res.status_code = Some(StatusCode::NO_CONTENT);
 }
 
 pub fn options_handler() -> Router {

@@ -1,36 +1,27 @@
 use std::sync::Arc;
 
-use salvo_core::http::HeaderValue;
+use salvo_core::http::StatusCode;
 use salvo_core::{Depot, Request, Response, Router, handler};
 
-use crate::error::{ProtocolError, TusError};
-use crate::handlers::apply_common_headers;
-use crate::utils::check_tus_version;
-use crate::{CancellationContext, H_TUS_RESUMABLE, H_TUS_VERSION, TUS_VERSION, Tus};
+use crate::error::TusError;
+use crate::handlers::{apply_common_headers, check_tus_version_or_respond};
+use crate::{CancellationContext, Tus};
 
 #[handler]
 async fn get(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let state = depot.obtain::<Arc<Tus>>().expect("missing tus state");
     let opts = &state.options;
     let store = &state.store;
-    let headers = apply_common_headers(&mut res.headers);
+    apply_common_headers(&mut res.headers, req.headers(), opts);
 
-    if let Err(e) = check_tus_version(
-        req.headers()
-            .get(H_TUS_RESUMABLE)
-            .and_then(|v| v.to_str().ok()),
-    ) {
-        if matches!(e, ProtocolError::UnsupportedTusVersion(_)) {
-            headers.insert(H_TUS_VERSION, HeaderValue::from_static(TUS_VERSION));
-        }
-        res.status_code(TusError::Protocol(e).status());
+    if !check_tus_version_or_respond(req, res) {
         return;
     }
 
     let id = match opts.get_file_id_from_request(req) {
         Ok(id) => id,
         Err(e) => {
-            res.status_code(e.status());
+            res.status_code = Some(e.status());
             return;
         }
     };
@@ -54,10 +45,24 @@ async fn get(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         let info = match store.get_upload_file_info(&id).await {
             Ok(info) => info,
             Err(e) => {
-                res.status_code(e.status());
+                res.status_code = Some(e.status());
                 return;
             }
         };
+
+        // Prevent serving partially uploaded files
+        match (info.offset, info.size) {
+            (Some(offset), Some(size)) if offset < size => {
+                res.status_code = Some(StatusCode::FORBIDDEN);
+                return;
+            }
+            (_, None) => {
+                // Deferred length upload not yet complete
+                res.status_code = Some(StatusCode::FORBIDDEN);
+                return;
+            }
+            _ => {}
+        }
 
         let storage = match info.storage {
             Some(storage) => storage,

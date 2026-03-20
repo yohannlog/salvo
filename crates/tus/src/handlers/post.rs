@@ -5,13 +5,15 @@ use salvo_core::http::{HeaderValue, StatusCode};
 use salvo_core::{Depot, Request, Response, Router, handler};
 
 use crate::error::{ProtocolError, TusError};
-use crate::handlers::{Metadata, apply_common_headers};
+use crate::handlers::{
+    Metadata, apply_common_headers, apply_upload_finish_hook, calculate_expiration,
+    check_tus_version_or_respond, parse_content_length, set_expiration_header,
+};
 use crate::stores::{Extension, UploadInfo};
-use crate::utils::{check_tus_version, parse_u64};
+use crate::utils::parse_u64;
 use crate::{
-    CT_OFFSET_OCTET_STREAM, CancellationContext, H_CONTENT_LENGTH, H_CONTENT_TYPE, H_TUS_RESUMABLE,
-    H_TUS_VERSION, H_UPLOAD_CONCAT, H_UPLOAD_DEFER_LENGTH, H_UPLOAD_EXPIRES, H_UPLOAD_LENGTH,
-    H_UPLOAD_METADATA, H_UPLOAD_OFFSET, TUS_VERSION, Tus,
+    CT_OFFSET_OCTET_STREAM, CancellationContext, H_CONTENT_TYPE, H_UPLOAD_CONCAT,
+    H_UPLOAD_DEFER_LENGTH, H_UPLOAD_LENGTH, H_UPLOAD_METADATA, H_UPLOAD_OFFSET, Tus,
 };
 
 /// HTTP/1.1 201 Created
@@ -22,17 +24,9 @@ async fn create(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let state = depot.obtain::<Arc<Tus>>().expect("missing tus state");
     let store = &state.store;
     let opts = &state.options;
-    apply_common_headers(&mut res.headers);
-    if let Err(e) = check_tus_version(
-        req.headers()
-            .get(H_TUS_RESUMABLE)
-            .and_then(|v| v.to_str().ok()),
-    ) {
-        if matches!(e, ProtocolError::UnsupportedTusVersion(_)) {
-            res.headers
-                .insert(H_TUS_VERSION, HeaderValue::from_static(TUS_VERSION));
-        }
-        res.status_code = Some(TusError::Protocol(e).status());
+    apply_common_headers(&mut res.headers, req.headers(), opts);
+
+    if !check_tus_version_or_respond(req, res) {
         return;
     }
 
@@ -191,24 +185,12 @@ async fn create(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         };
 
         if creation_with_upload {
-            let content_length = match req.headers().get(H_CONTENT_LENGTH) {
-                Some(value) => match value.to_str() {
-                    Ok(v) => match parse_u64(Some(v), H_CONTENT_LENGTH) {
-                        Ok(size) => Some(size),
-                        Err(e) => {
-                            res.status_code = Some(TusError::Protocol(e).status());
-                            return;
-                        }
-                    },
-                    Err(_) => {
-                        res.status_code = Some(
-                            TusError::Protocol(ProtocolError::InvalidInt(H_CONTENT_LENGTH))
-                                .status(),
-                        );
-                        return;
-                    }
-                },
-                None => None,
+            let content_length = match parse_content_length(req) {
+                Ok(cl) => cl,
+                Err(e) => {
+                    res.status_code = Some(e.status());
+                    return;
+                }
             };
 
             let max_allowed = match (upload.size, max_file_size) {
@@ -257,77 +239,25 @@ async fn create(req: &mut Request, depot: &mut Depot, res: &mut Response) {
 
     tracing::info!("Generated file url: {}", &url);
 
-    if store.has_extension(Extension::Expiration) {
-        if let Some(expiration) = store.get_expiration() {
-            if expiration > std::time::Duration::from_secs(0) && !upload.creation_date.is_empty() {
-                let is_finished = match (upload.offset, upload.size) {
-                    (Some(offset), Some(size)) => offset == size,
-                    _ => false,
-                };
-
-                if !is_finished {
-                    if let Ok(created_at) =
-                        chrono::DateTime::parse_from_rfc3339(&upload.creation_date)
-                    {
-                        if let Ok(delta) = chrono::Duration::from_std(expiration) {
-                            let expires = created_at.with_timezone(&chrono::Utc) + delta;
-                            let expires_value =
-                                expires.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-                            res.headers.insert(
-                                H_UPLOAD_EXPIRES,
-                                HeaderValue::from_str(&expires_value).unwrap(),
-                            );
-                        }
-                    }
-                }
-            }
-        }
+    if let Some(expires_at) = calculate_expiration(store.as_ref(), &upload.creation_date) {
+        set_expiration_header(&mut res.headers, expires_at, upload.offset, upload.size);
     }
 
     if is_final {
-        if let Some(on_upload_finish) = &opts.on_upload_finish {
-            match on_upload_finish(req, upload.clone()).await {
-                Ok(patch) => {
-                    if let Some(status) = patch.status_code {
-                        res.status_code = Some(status);
-                    }
-                    if let Some(body) = patch.body {
-                        if res.write_body(body).is_err() {
-                            res.status_code = Some(
-                                TusError::Internal("failed to write response body".into()).status(),
-                            );
-                            return;
-                        }
-                    }
-                    if let Some(headers) = patch.headers {
-                        for (key, value) in headers {
-                            if let Some(key) = key {
-                                if !res.headers.contains_key(&key) {
-                                    res.headers.insert(key, value);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    res.status_code = Some(e.status());
-                    return;
-                }
-            }
-        }
+        apply_upload_finish_hook(req, opts, upload, res).await;
     }
 
     // The Upload-Expires response header indicates the time after which the unfinished upload
     // expires. If expiration is known at creation time, Upload-Expires header MUST be included
     // in the response
 
-    if res.status_code == Some(StatusCode::CREATED) || res.status_code.unwrap().is_redirection() {
+    let status = res.status_code.unwrap_or(StatusCode::CREATED);
+    if status == StatusCode::CREATED || status.is_redirection() {
         res.headers
             .insert("Location", HeaderValue::from_str(&url).unwrap());
     }
 
     if res.body.is_none() {
-        let status = res.status_code.unwrap_or(StatusCode::OK);
         if !status.is_client_error()
             && !status.is_server_error()
             && !status.is_redirection()

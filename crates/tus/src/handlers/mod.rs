@@ -17,33 +17,187 @@ pub use options::options_handler;
 pub use patch::patch_handler;
 pub use post::post_handler;
 use salvo_core::http::{HeaderMap, HeaderValue};
+use salvo_core::{Request, Response};
 
-use crate::error::ProtocolError;
-use crate::{H_TUS_RESUMABLE, TUS_VERSION};
+use crate::error::{ProtocolError, TusError};
+use crate::options::TusOptions;
+use crate::stores::{DataStore, Extension};
+use crate::utils::{check_tus_version, parse_u64};
+use crate::{
+    H_CONTENT_LENGTH, H_TUS_RESUMABLE, H_TUS_VERSION, H_UPLOAD_EXPIRES, TUS_VERSION,
+};
 
 pub(crate) const EXPOSE_HEADERS: &str = "Location, Upload-Offset, Upload-Length, Upload-Metadata, Upload-Expires, Tus-Resumable, Tus-Version, Tus-Extension, Tus-Max-Size";
 
-pub(crate) fn apply_common_headers(headers: &mut HeaderMap) -> &mut HeaderMap {
-    headers.insert(H_TUS_RESUMABLE, HeaderValue::from_static(TUS_VERSION));
-    headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
-    headers.insert(
-        "access-control-expose-headers",
-        HeaderValue::from_static(EXPOSE_HEADERS),
-    );
-    headers.insert("cache-control", HeaderValue::from_static("no-store"));
+fn apply_cors_headers(headers: &mut HeaderMap, req_headers: &HeaderMap, opts: &TusOptions) {
+    // Access-Control-Allow-Origin
+    if opts.allowed_origins.is_empty() {
+        if opts.allowed_credentials {
+            // Cannot use `*` with credentials; echo back request Origin if present
+            if let Some(origin) = req_headers.get("origin").and_then(|v| v.to_str().ok()) {
+                if let Ok(v) = HeaderValue::from_str(origin) {
+                    headers.insert("access-control-allow-origin", v);
+                }
+            }
+        } else {
+            headers.insert(
+                "access-control-allow-origin",
+                HeaderValue::from_static("*"),
+            );
+        }
+    } else if let Some(origin) = req_headers.get("origin").and_then(|v| v.to_str().ok()) {
+        if opts.allowed_origins.iter().any(|o| o == origin) {
+            if let Ok(v) = HeaderValue::from_str(origin) {
+                headers.insert("access-control-allow-origin", v);
+            }
+        }
+    }
 
-    headers
+    // Access-Control-Allow-Credentials
+    if opts.allowed_credentials {
+        headers.insert(
+            "access-control-allow-credentials",
+            HeaderValue::from_static("true"),
+        );
+    }
+
+    // Access-Control-Expose-Headers
+    if opts.exposed_headers.is_empty() {
+        headers.insert(
+            "access-control-expose-headers",
+            HeaderValue::from_static(EXPOSE_HEADERS),
+        );
+    } else {
+        let mut expose = EXPOSE_HEADERS.to_string();
+        expose.push_str(", ");
+        expose.push_str(&opts.exposed_headers.join(", "));
+        if let Ok(v) = HeaderValue::from_str(&expose) {
+            headers.insert("access-control-expose-headers", v);
+        }
+    }
 }
 
-pub(crate) fn apply_options_headers(headers: &mut HeaderMap) -> &mut HeaderMap {
-    headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
-    headers.insert(
-        "access-control-expose-headers",
-        HeaderValue::from_static(EXPOSE_HEADERS),
-    );
+pub(crate) fn apply_common_headers(
+    headers: &mut HeaderMap,
+    req_headers: &HeaderMap,
+    opts: &TusOptions,
+) {
+    headers.insert(H_TUS_RESUMABLE, HeaderValue::from_static(TUS_VERSION));
+    apply_cors_headers(headers, req_headers, opts);
     headers.insert("cache-control", HeaderValue::from_static("no-store"));
+}
 
-    headers
+pub(crate) fn apply_options_headers(
+    headers: &mut HeaderMap,
+    req_headers: &HeaderMap,
+    opts: &TusOptions,
+) {
+    apply_cors_headers(headers, req_headers, opts);
+    headers.insert("cache-control", HeaderValue::from_static("no-store"));
+}
+
+/// Check TUS version header. Returns `false` and sets error response if invalid.
+pub(crate) fn check_tus_version_or_respond(req: &Request, res: &mut Response) -> bool {
+    if let Err(e) = check_tus_version(
+        req.headers()
+            .get(H_TUS_RESUMABLE)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        if matches!(e, ProtocolError::UnsupportedTusVersion(_)) {
+            res.headers
+                .insert(H_TUS_VERSION, HeaderValue::from_static(TUS_VERSION));
+        }
+        res.status_code = Some(TusError::Protocol(e).status());
+        return false;
+    }
+    true
+}
+
+/// Calculate the expiration datetime for an upload.
+pub(crate) fn calculate_expiration(
+    store: &dyn DataStore,
+    creation_date: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if !store.has_extension(Extension::Expiration) {
+        return None;
+    }
+    let expiration = store.get_expiration()?;
+    if expiration <= std::time::Duration::from_secs(0) || creation_date.is_empty() {
+        return None;
+    }
+    let created_at = chrono::DateTime::parse_from_rfc3339(creation_date).ok()?;
+    let delta = chrono::Duration::from_std(expiration).ok()?;
+    Some(created_at.with_timezone(&chrono::Utc) + delta)
+}
+
+/// Set the Upload-Expires header on the response if the upload is unfinished.
+pub(crate) fn set_expiration_header(
+    headers: &mut HeaderMap,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    offset: Option<u64>,
+    size: Option<u64>,
+) {
+    let is_finished = matches!((offset, size), (Some(o), Some(s)) if o == s);
+    if !is_finished {
+        let expires_value = expires_at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        if let Ok(v) = HeaderValue::from_str(&expires_value) {
+            headers.insert(H_UPLOAD_EXPIRES, v);
+        }
+    }
+}
+
+/// Parse Content-Length header from request.
+pub(crate) fn parse_content_length(req: &Request) -> Result<Option<u64>, TusError> {
+    match req.headers().get(H_CONTENT_LENGTH) {
+        Some(value) => match value.to_str() {
+            Ok(v) => match parse_u64(Some(v), H_CONTENT_LENGTH) {
+                Ok(size) => Ok(Some(size)),
+                Err(e) => Err(TusError::Protocol(e)),
+            },
+            Err(_) => Err(TusError::Protocol(ProtocolError::InvalidInt(
+                H_CONTENT_LENGTH,
+            ))),
+        },
+        None => Ok(None),
+    }
+}
+
+/// Apply the on_upload_finish hook and merge its result into the response.
+pub(crate) async fn apply_upload_finish_hook(
+    req: &Request,
+    opts: &TusOptions,
+    upload: crate::stores::UploadInfo,
+    res: &mut Response,
+) {
+    if let Some(on_upload_finish) = &opts.on_upload_finish {
+        match on_upload_finish(req, upload).await {
+            Ok(patch) => {
+                if let Some(status) = patch.status_code {
+                    res.status_code = Some(status);
+                }
+                if let Some(body) = patch.body {
+                    if res.write_body(body).is_err() {
+                        res.status_code = Some(
+                            TusError::Internal("failed to write response body".into()).status(),
+                        );
+                        return;
+                    }
+                }
+                if let Some(headers) = patch.headers {
+                    for (key, value) in headers {
+                        if let Some(key) = key {
+                            if !res.headers.contains_key(&key) {
+                                res.headers.insert(key, value);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                res.status_code = Some(e.status());
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]

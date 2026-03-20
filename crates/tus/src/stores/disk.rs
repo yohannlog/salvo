@@ -1,10 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use salvo_core::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
-use tokio::io::{self, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{self, AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tracing::warn;
 
 use crate::error::{TusError, TusResult};
@@ -43,7 +44,7 @@ struct MetaUpload {
     id: String,
     size: Option<u64>,
     offset: u64,
-    metadata: Option<HashMap<String, Option<String>>>,
+    metadata: Option<std::collections::HashMap<String, Option<String>>>,
     storage: Option<MetaStoreInfo>,
     creation_date: String,
 }
@@ -77,25 +78,32 @@ impl From<MetaUpload> for UploadInfo {
 #[derive(Clone)]
 pub struct DiskStore {
     root: PathBuf,
+    root_ensured: std::sync::Arc<AtomicBool>,
 }
 
 impl DiskStore {
     pub fn new() -> Self {
         Self {
             root: "./tus-upload-files".into(),
+            root_ensured: std::sync::Arc::new(AtomicBool::new(false)),
         }
     }
 
-    #[allow(dead_code)]
     pub fn disk_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.root = root.into();
+        self.root_ensured = std::sync::Arc::new(AtomicBool::new(false));
         self
     }
 
     async fn ensure_root(&self) -> TusResult<()> {
+        if self.root_ensured.load(Ordering::Acquire) {
+            return Ok(());
+        }
         fs::create_dir_all(&self.root)
             .await
-            .map_err(|e| TusError::Internal(e.to_string()))
+            .map_err(|e| TusError::Internal(e.to_string()))?;
+        self.root_ensured.store(true, Ordering::Release);
+        Ok(())
     }
 
     fn data_path(&self, id: &str) -> PathBuf {
@@ -259,8 +267,6 @@ impl DiskStore {
 
 #[async_trait]
 impl DataStore for DiskStore {
-    /// The DiskStore support extensions.
-    /// Extension::Creation
     fn extensions(&self) -> HashSet<Extension> {
         let mut support_extensions = HashSet::new();
         support_extensions.insert(Extension::Creation);
@@ -268,6 +274,16 @@ impl DataStore for DiskStore {
         support_extensions.insert(Extension::CreationWithUpload);
         support_extensions.insert(Extension::Termination);
         support_extensions
+    }
+
+    fn has_extension(&self, ext: Extension) -> bool {
+        matches!(
+            ext,
+            Extension::Creation
+                | Extension::CreationDeferLength
+                | Extension::CreationWithUpload
+                | Extension::Termination
+        )
     }
 
     async fn create(&self, file: UploadInfo) -> TusResult<UploadInfo> {
@@ -346,7 +362,7 @@ impl DataStore for DiskStore {
         }
 
         let path = self.resolve_data_path(id, &meta.storage);
-        let mut file = fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .write(true)
             .open(path)
             .await
@@ -355,7 +371,9 @@ impl DataStore for DiskStore {
                 _ => TusError::Internal(e.to_string()),
             })?;
 
-        file.seek(SeekFrom::Start(offset))
+        let mut writer = BufWriter::new(file);
+        writer
+            .seek(SeekFrom::Start(offset))
             .await
             .map_err(|e| TusError::Internal(e.to_string()))?;
 
@@ -366,17 +384,22 @@ impl DataStore for DiskStore {
             let chunk = item.map_err(|e| TusError::Internal(e.to_string()))?;
             if let Some(size) = meta.size {
                 if original_offset + written + chunk.len() as u64 > size {
-                    let _ = file.set_len(original_offset).await;
+                    let inner = writer.into_inner();
+                    if let Err(e) = inner.set_len(original_offset).await {
+                        warn!("failed to truncate file after payload overflow: {}", e);
+                    }
                     return Err(TusError::PayloadTooLarge);
                 }
             }
-            file.write_all(&chunk)
+            writer
+                .write_all(&chunk)
                 .await
                 .map_err(|e| TusError::Internal(e.to_string()))?;
             written += chunk.len() as u64;
         }
 
-        file.flush()
+        writer
+            .flush()
             .await
             .map_err(|e| TusError::Internal(e.to_string()))?;
 

@@ -14,13 +14,15 @@ pub trait Locker: Send + Sync + 'static {
     async fn write_lock(&self, id: &str) -> TusResult<LockGuard> {
         self.lock(id).await
     }
+    /// Remove the lock entry for the given upload ID.
+    /// Called after an upload is deleted to prevent memory leaks.
+    async fn remove_lock(&self, _id: &str) {}
 }
 
 pub struct LockGuard {
     _guard: LockGuardInner,
 }
 
-#[allow(dead_code)]
 enum LockGuardInner {
     Read(OwnedRwLockReadGuard<()>),
     Write(OwnedRwLockWriteGuard<()>),

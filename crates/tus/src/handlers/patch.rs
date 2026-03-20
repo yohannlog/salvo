@@ -5,12 +5,15 @@ use salvo_core::http::{HeaderValue, StatusCode};
 use salvo_core::{Depot, Request, Response, Router, handler};
 
 use crate::error::{ProtocolError, TusError};
-use crate::handlers::apply_common_headers;
+use crate::handlers::{
+    apply_common_headers, apply_upload_finish_hook, calculate_expiration,
+    check_tus_version_or_respond, parse_content_length, set_expiration_header,
+};
 use crate::stores::Extension;
-use crate::utils::{check_tus_version, parse_u64};
+use crate::utils::parse_u64;
 use crate::{
-    CT_OFFSET_OCTET_STREAM, CancellationContext, H_CONTENT_LENGTH, H_CONTENT_TYPE, H_TUS_RESUMABLE,
-    H_TUS_VERSION, H_UPLOAD_EXPIRES, H_UPLOAD_LENGTH, H_UPLOAD_OFFSET, TUS_VERSION, Tus,
+    CT_OFFSET_OCTET_STREAM, CancellationContext, H_CONTENT_TYPE, H_UPLOAD_LENGTH, H_UPLOAD_OFFSET,
+    Tus,
 };
 
 #[handler]
@@ -18,7 +21,7 @@ async fn patch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let state = depot.obtain::<Arc<Tus>>().expect("missing tus state");
     let opts = &state.options;
     let store = &state.store;
-    apply_common_headers(&mut res.headers);
+    apply_common_headers(&mut res.headers, req.headers(), opts);
 
     let id = match opts.get_file_id_from_request(req) {
         Ok(id) => id,
@@ -28,21 +31,11 @@ async fn patch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         }
     };
 
-    // 1. Check TUS version.
-    if let Err(e) = check_tus_version(
-        req.headers()
-            .get(H_TUS_RESUMABLE)
-            .and_then(|v| v.to_str().ok()),
-    ) {
-        if matches!(e, ProtocolError::UnsupportedTusVersion(_)) {
-            res.headers
-                .insert(H_TUS_VERSION, HeaderValue::from_static(TUS_VERSION));
-        }
-        res.status_code = Some(TusError::Protocol(e).status());
+    if !check_tus_version_or_respond(req, res) {
         return;
     }
 
-    // 2. Check Content Type. The request MUST include a Content-Type header
+    // Check Content Type. The request MUST include a Content-Type header
     let content_type = req
         .headers()
         .get(H_CONTENT_TYPE)
@@ -52,7 +45,7 @@ async fn patch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         return;
     }
 
-    // 3. Check Upload-Offset. The request MUST include a Upload-Offset header
+    // Check Upload-Offset. The request MUST include a Upload-Offset header
     let offset = match parse_u64(
         req.headers()
             .get(H_UPLOAD_OFFSET)
@@ -92,37 +85,14 @@ async fn patch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         }
     };
 
-    let mut expires_at = None;
-    if store.has_extension(Extension::Expiration) {
-        if let Some(expiration) = store.get_expiration() {
-            if expiration > std::time::Duration::from_secs(0)
-                && !already_uploaded_info.creation_date.is_empty()
-            {
-                if let Ok(created_at) =
-                    chrono::DateTime::parse_from_rfc3339(&already_uploaded_info.creation_date)
-                {
-                    if let Ok(delta) = chrono::Duration::from_std(expiration) {
-                        let expires = created_at.with_timezone(&chrono::Utc) + delta;
-                        if chrono::Utc::now() > expires {
-                            res.status_code = Some(TusError::FileNoLongerExists.status());
-                            return;
-                        }
-                        expires_at = Some(expires);
-                    }
-                }
-            }
+    // Check expiration
+    let expires_at = calculate_expiration(store.as_ref(), &already_uploaded_info.creation_date);
+    if let Some(expires_at) = expires_at {
+        if chrono::Utc::now() > expires_at {
+            res.status_code = Some(TusError::FileNoLongerExists.status());
+            return;
         }
     }
-
-    // If a Client does attempt to resume an upload which has since
-    // been removed by the Server, the Server SHOULD respond with the
-    // with the 404 Not Found or 410 Gone status. The latter one SHOULD
-    // be used if the Server is keeping track of expired uploads.
-
-    // 404: deleted
-    // 410: expiration
-
-    // TODO: Time handle
 
     let Some(uploaded_info_offset) = already_uploaded_info.offset else {
         res.status_code = Some(TusError::InvalidOffset.status());
@@ -182,22 +152,12 @@ async fn patch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         already_uploaded_info.size = Some(size);
     }
 
-    let content_length = match req.headers().get(H_CONTENT_LENGTH) {
-        Some(value) => match value.to_str() {
-            Ok(v) => match parse_u64(Some(v), H_CONTENT_LENGTH) {
-                Ok(size) => Some(size),
-                Err(e) => {
-                    res.status_code = Some(TusError::Protocol(e).status());
-                    return;
-                }
-            },
-            Err(_) => {
-                res.status_code =
-                    Some(TusError::Protocol(ProtocolError::InvalidInt(H_CONTENT_LENGTH)).status());
-                return;
-            }
-        },
-        None => None,
+    let content_length = match parse_content_length(req) {
+        Ok(cl) => cl,
+        Err(e) => {
+            res.status_code = Some(e.status());
+            return;
+        }
     };
 
     let max_allowed = match (already_uploaded_info.size, max_file_size) {
@@ -214,10 +174,6 @@ async fn patch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         }
     }
 
-    // let max_body_size = opts.calculate_max_body_size(req, already_uploaded_info,
-    // max_file_size).await; let new_offset = store.write(req.body, already_uploaded_info,
-    // max_body_size, context);
-
     let body = req.take_body();
     let stream = body.map(|frame| frame.map(|frame| frame.into_data().unwrap_or_default()));
     let written = match store.write(&id, offset, Box::pin(stream)).await {
@@ -230,30 +186,32 @@ async fn patch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
 
     let new_offset = offset + written;
 
+    // Set expiration header if applicable
     if let Some(expires_at) = expires_at {
-        let is_finished = match already_uploaded_info.size {
-            Some(size) => new_offset == size,
-            None => false,
-        };
-
-        if !is_finished {
-            let expires_value = expires_at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-            res.headers.insert(
-                H_UPLOAD_EXPIRES,
-                HeaderValue::from_str(&expires_value).unwrap(),
-            );
-        }
+        set_expiration_header(
+            &mut res.headers,
+            expires_at,
+            Some(new_offset),
+            already_uploaded_info.size,
+        );
     }
 
     // The Server MUST acknowledge successful PATCH requests with the 204 No Content status.
     // It MUST include the Upload-Offset header containing the new offset.
-    // The new offset MUST be the sum of the offset before the PATCH request and the number of bytes
-    // received and processed or stored during the current PATCH request.
     res.status_code = Some(StatusCode::NO_CONTENT);
     res.headers.insert(
         H_UPLOAD_OFFSET,
         HeaderValue::from_str(&new_offset.to_string()).unwrap(),
     );
+
+    // Call on_upload_finish hook when upload is complete
+    let is_complete = already_uploaded_info
+        .size
+        .is_some_and(|size| new_offset == size);
+    if is_complete {
+        already_uploaded_info.offset = Some(new_offset);
+        apply_upload_finish_hook(req, opts, already_uploaded_info, res).await;
+    }
 }
 
 pub fn patch_handler() -> Router {

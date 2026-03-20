@@ -44,4 +44,9 @@ impl Locker for MemoryLocker {
         let guard = lock.write_owned().await;
         Ok(LockGuard::write(guard))
     }
+
+    async fn remove_lock(&self, id: &str) {
+        let mut map = self.inner.lock().await;
+        map.remove(id);
+    }
 }
